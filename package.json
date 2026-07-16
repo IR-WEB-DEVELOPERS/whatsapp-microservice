@@ -1,0 +1,21 @@
+{
+  "name": "padmavani-whatsapp-microservice",
+  "version": "1.0.0",
+  "description": "Standalone WhatsApp sender for Padmavani School Dashboard — runs whatsapp-web.js on its own Render service, separate from the main dashboard, so the main service stays light on the free tier.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "cors": "^2.8.5",
+    "helmet": "^8.1.0",
+    "express-rate-limit": "^7.5.0",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0"
+  },
+  "license": "ISC"
+}
