@@ -24,13 +24,38 @@
  *   POST /logout              — auth required. Clears the saved session (force re-scan).
  *
  * Anti-ban behaviour (tunable via env vars, see the "Anti-ban tuning" block
- * in this file): 10-20s randomized gap between messages, randomized batch
- * sizes of 10-15 with a 3-6 min pause between batches, a default 9 AM-7 PM
- * sending window, a 150/day hard ceiling, typing-simulation before each
- * send, and a circuit breaker that halts all sending the moment WhatsApp's
- * responses start looking like a rate-limit/ban rather than retrying blind.
- * None of this makes a ban impossible — Baileys is an unofficial client —
- * but it's tuned deliberately slow/conservative rather than fast/risky.
+ * in this file):
+ *   - 10-20s Gaussian-jittered gap between messages (bell-curve, not flat
+ *     random — a uniform distribution is itself a detectable pattern)
+ *   - randomized batch sizes of 10-15 with a 3-6 min pause between batches
+ *   - default 9 AM-7 PM sending window
+ *   - a 150/day hard ceiling, PERSISTED across restarts (see antiban-state.json
+ *     in the auth folder) so a Render redeploy can't silently reset it
+ *   - a warm-up ramp: a newly-linked (or re-linked) number starts at ~15/day
+ *     and scales up to the full daily limit over WHATSAPP_WARMUP_DAYS (21 by
+ *     default) — abrupt full-volume sending from a fresh link is itself a signal
+ *   - a minimum 12h gap before messaging the same recipient again
+ *   - typing-simulation before each send
+ *   - a circuit breaker that halts sending the moment WhatsApp's responses
+ *     start looking like a rate-limit/ban rather than retrying blind
+ *   - read-receipt tracking that computes a real unread-message ratio and
+ *     proactively pauses if it crosses a threshold — per current (2025-2026)
+ *     industry research this is the single strongest ban-risk signal
+ *     (unanswered proactive messages to people who don't reply), well above
+ *     raw send speed, which is only one layer among several
+ *
+ * IMPORTANT — read this honestly: none of the above makes a ban impossible.
+ * Baileys is an unofficial client that reverse-engineers the WhatsApp Web
+ * protocol; using it on a regular number is against WhatsApp's Terms of
+ * Service and WhatsApp can act on that at any time regardless of pacing.
+ * The layers above reduce the *behavioural* signals WhatsApp's systems look
+ * for (bot-like timing, stranger-messaging with no engagement, abrupt new-
+ * number volume) but they do not, and cannot, eliminate ToS/ban risk. For a
+ * school sending real, verifiable notifications to parents, the WhatsApp
+ * Business (Cloud) API via an official Meta Business Solution Provider is
+ * the only route with no ToS risk — worth it if this number getting banned
+ * repeatedly is costing more (in re-setup time and missed notifications)
+ * than the API's per-message cost would.
  */
 
 require('dotenv').config();
@@ -98,6 +123,77 @@ let lastQrDataUrl = null;
 let messageQueue = [];
 let isProcessing = false;
 
+// ─── Persistent anti-ban state ─────────────────────────────────────────────
+// Previously dailyCount/dailyDateKey lived only in memory, which meant a
+// Render restart (free tier spins down/redeploys often) silently reset the
+// daily ceiling — the ONE hard limit that isn't just timing. It also had no
+// idea how old the linked number's automation history was, or whether
+// recipients were actually reading/replying, which are the signals that
+// actually drive WhatsApp's ban decisions (far more than send pacing does).
+// This file persists that state across restarts.
+const STATE_FILE = process.env.WHATSAPP_STATE_FILE || require('path').join(AUTH_PATH, 'antiban-state.json');
+
+function loadPersistedState() {
+    try {
+        if (fs.existsSync(STATE_FILE)) {
+            return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.warn('[WhatsApp] Could not read antiban-state.json, starting fresh:', e.message);
+    }
+    return {};
+}
+
+function savePersistedState() {
+    try {
+        fs.mkdirSync(AUTH_PATH, { recursive: true });
+        fs.writeFileSync(STATE_FILE, JSON.stringify({
+            dailyCount, dailyDateKey, firstLinkDate,
+            recipientHistory, sentLog,
+        }));
+    } catch (e) {
+        console.warn('[WhatsApp] Could not persist antiban-state.json:', e.message);
+    }
+}
+
+const persisted = loadPersistedState();
+
+// First-linked date — used to gate a "warm-up" ramp for numbers new to
+// automation (see WARMUP logic below). If this isn't already known, it's
+// set the first time the socket successfully connects (see 'open' handler).
+let firstLinkDate = persisted.firstLinkDate || null;
+
+// Per-recipient send history: { [jid]: lastSentAtMs } — enforces a minimum
+// gap before messaging the same person again. Messaging the same stranger
+// multiple times a day is one of the clearer "this isn't a human" signals,
+// independent of overall pacing.
+let recipientHistory = persisted.recipientHistory || {};
+const MIN_RECIPIENT_GAP_MS = Number(process.env.WHATSAPP_MIN_RECIPIENT_GAP_MS) || 12 * 60 * 60 * 1000; // 12h
+
+// Rolling log of recent sends with delivery/read status, used to compute a
+// real reply/read ratio — this is the actual top-weighted ban signal
+// (unanswered proactive messages to strangers), not send speed. Each entry:
+// { jid, sentAt, status: 'sent'|'delivered'|'read'|'failed' }
+let sentLog = persisted.sentLog || [];
+const SENT_LOG_MAX = 500; // cap so the state file doesn't grow unbounded
+
+function pruneSentLog() {
+    if (sentLog.length > SENT_LOG_MAX) sentLog = sentLog.slice(sentLog.length - SENT_LOG_MAX);
+}
+
+function currentUnreadRatio() {
+    // Only judge messages old enough to plausibly have been read (>2h),
+    // otherwise every fresh batch looks artificially "unread".
+    const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+    const judgable = sentLog.filter(e => e.sentAt < twoHoursAgo && e.status !== 'failed');
+    if (judgable.length < 15) return null; // not enough data yet to mean anything
+    const unread = judgable.filter(e => e.status !== 'read' && e.status !== 'replied').length;
+    return unread / judgable.length;
+}
+// If this fraction of judgable messages are still un-read after the window,
+// treat it as a live ban-risk signal, same tier as a circuit-breaker trip.
+const UNREAD_RATIO_ALERT_THRESHOLD = Number(process.env.WHATSAPP_UNREAD_RATIO_THRESHOLD) || 0.85;
+
 // ─── Anti-ban tuning ────────────────────────────────────────────────────────
 // These exist because a script that sends messages at a perfectly fixed
 // interval, back-to-back, with no daily ceiling, is exactly the pattern
@@ -138,6 +234,21 @@ function randomDelay(minMs, maxMs) {
     return minMs + Math.floor(Math.random() * (maxMs - minMs));
 }
 
+// A flat uniform distribution between min/max is itself a subtle statistical
+// tell — real human gaps cluster around a typical value with occasional
+// longer tails, not an even spread. Box-Muller gives a bell-curve centered
+// on the midpoint, clamped to [min, max].
+function gaussianDelay(minMs, maxMs) {
+    const mid = (minMs + maxMs) / 2;
+    const spread = (maxMs - minMs) / 4; // ~95% of samples land inside [min,max]
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    const val = mid + z * spread;
+    return Math.max(minMs, Math.min(maxMs, Math.round(val)));
+}
+
 function randomBatchSize() {
     return BATCH_SIZE_MIN + Math.floor(Math.random() * (BATCH_SIZE_MAX - BATCH_SIZE_MIN + 1));
 }
@@ -158,25 +269,35 @@ function looksLikeBanSignal(message) {
     return BAN_SIGNAL_PATTERNS.some(re => re.test(String(message || '')));
 }
 
-// Persist-free daily counter — resets when the date (IST-agnostic, server
-// local date) changes. Good enough for a single small deployment; if the
-// service restarts mid-day the counter resets, which is intentionally on
-// the safe side (under-sending, never over-sending across a restart boundary
-// isn't guaranteed, but this is a soft safety net, not the only one — see
-// the fixed per-message delay + batch pauses above which are the real guard).
-let dailyCount = 0;
-let dailyDateKey = new Date().toDateString();
+// Daily counter — now persisted (see savePersistedState above) so a Render
+// restart mid-day can't silently reset it and let the queue blow through
+// the daily ceiling. This IS the one hard limit that matters most; the
+// per-message/batch delays only smooth out how it's spent through the day.
+let dailyCount = persisted.dailyCount || 0;
+let dailyDateKey = persisted.dailyDateKey || new Date().toDateString();
 
-function checkAndBumpDailyLimit() {
-    const todayKey = new Date().toDateString();
-    if (todayKey !== dailyDateKey) {
-        dailyDateKey = todayKey;
-        dailyCount = 0;
-    }
-    if (dailyCount >= DAILY_LIMIT) return false;
-    dailyCount++;
-    return true;
+// ── Warm-up ramp ────────────────────────────────────────────────────────
+// A number that starts sending 150/day from the moment it's linked (or
+// re-linked after a ban/logout) looks nothing like organic usage growth,
+// which is itself a signal. Ramp the effective daily cap up over the first
+// few weeks of this number's automation history instead of using DAILY_LIMIT
+// at full strength immediately. Community "warming" practice: ramp slowly
+// over 2-4 weeks — not an official Meta guarantee, just materially less
+// abrupt than going full-volume on day one.
+const WARMUP_DAYS = Number(process.env.WHATSAPP_WARMUP_DAYS) || 21;
+const WARMUP_START_LIMIT = Number(process.env.WHATSAPP_WARMUP_START_LIMIT) || 15;
+
+function effectiveDailyLimit() {
+    if (!firstLinkDate) return WARMUP_START_LIMIT; // haven't even confirmed a stable link yet — stay minimal
+    const daysSinceLink = (Date.now() - firstLinkDate) / (24 * 60 * 60 * 1000);
+    if (daysSinceLink >= WARMUP_DAYS) return DAILY_LIMIT;
+    const progress = daysSinceLink / WARMUP_DAYS;
+    return Math.round(WARMUP_START_LIMIT + (DAILY_LIMIT - WARMUP_START_LIMIT) * progress);
 }
+
+// NOTE: dailyCount now only increments on an actual successful sendMessage()
+// (see processQueue below), not speculatively before the send is attempted —
+// so a failed/circuit-broken send no longer eats into the daily budget.
 
 let logger; // created once pino has been loaded — see loadBaileysDeps()
 
@@ -220,6 +341,46 @@ async function initWhatsApp() {
 
         newSock.ev.on('creds.update', saveCreds);
 
+        // Baileys reports delivery/read receipts here (status: 2=delivered,
+        // 3=read/played, 4=played). We match them back to our sentLog by
+        // message id to compute a real "are people actually reading these"
+        // ratio — the strongest ban-risk signal per current research, well
+        // above raw send speed.
+        newSock.ev.on('messages.update', (updates) => {
+            let changed = false;
+            for (const u of updates) {
+                const id = u.key?.id;
+                const status = u.update?.status;
+                if (!id || status == null) continue;
+                const entry = sentLog.find(e => e.msgId === id);
+                if (!entry) continue;
+                if (status >= 3 && entry.status !== 'read') { entry.status = 'read'; changed = true; }
+                else if (status === 2 && entry.status === 'sent') { entry.status = 'delivered'; changed = true; }
+            }
+            if (changed) savePersistedState();
+        });
+
+        // An actual incoming reply from a recipient is a stronger signal
+        // than a read receipt — it's proof of two-way engagement, which is
+        // exactly what "reply OK to confirm" style prompts are meant to
+        // produce. Mark any sentLog entries for that jid as 'replied' (the
+        // best status), which counts as engaged in currentUnreadRatio().
+        newSock.ev.on('messages.upsert', ({ messages }) => {
+            let changed = false;
+            for (const m of messages || []) {
+                if (m.key?.fromMe) continue; // only incoming
+                const jid = m.key?.remoteJid;
+                if (!jid) continue;
+                for (const entry of sentLog) {
+                    if (entry.jid === jid && entry.status !== 'replied') {
+                        entry.status = 'replied';
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) savePersistedState();
+        });
+
         newSock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
 
@@ -237,6 +398,11 @@ async function initWhatsApp() {
                 isReady = true;
                 isInitializing = false;
                 lastQrDataUrl = null;
+                if (!firstLinkDate) {
+                    firstLinkDate = Date.now();
+                    savePersistedState();
+                    console.log('[WhatsApp] First link recorded — warm-up ramp starts now (full volume not reached for', WARMUP_DAYS, 'days).');
+                }
                 console.log('[WhatsApp] Client is ready!');
                 processQueue();
             }
@@ -250,12 +416,45 @@ async function initWhatsApp() {
                     ? lastDisconnect.error.output?.statusCode
                     : lastDisconnect?.error?.output?.statusCode;
                 const loggedOut = statusCode === DisconnectReason.loggedOut;
+                // A 401/"conflict" with reason "device_removed" (or similar
+                // conflict codes) means WhatsApp itself force-removed this
+                // linked session — this is different from a normal re-scan
+                // logout, and often follows a spam/rate restriction on the
+                // account (e.g. the 24h temporary block). Hammering it with
+                // a fresh QR every few seconds is exactly the wrong move
+                // here: it looks like more automated behaviour on an account
+                // that's already under scrutiny. Back off hard instead.
+                const conflictReason = update.lastDisconnect?.error?.output?.payload?.message
+                    || JSON.stringify(lastDisconnect?.error?.data?.node?.content || '');
+                const looksLikeForcedRemoval = /device_removed|conflict/i.test(String(lastDisconnect?.error?.message || '') + conflictReason)
+                    || statusCode === 401;
 
                 console.warn('[WhatsApp] Connection closed:', lastDisconnect?.error?.message || 'unknown reason', loggedOut ? '(logged out — will need a fresh QR scan)' : '(will attempt reconnect)');
 
                 sock = null;
 
-                if (loggedOut) {
+                if (loggedOut && looksLikeForcedRemoval) {
+                    // Likely signal of an account-level restriction (e.g. the
+                    // temporary block WhatsApp shows in the phone app after
+                    // spam-pattern detection). Reset the warm-up ramp so the
+                    // next successful link starts back at WARMUP_START_LIMIT
+                    // instead of wherever it left off, force the circuit
+                    // breaker open so nothing auto-sends on relink without a
+                    // human explicitly calling /resume, and wait a long
+                    // cooldown before even generating a new QR.
+                    firstLinkDate = null;
+                    circuitBroken = true;
+                    circuitBrokenReason = 'Session was force-removed by WhatsApp (device_removed/conflict) — this usually follows an account restriction. Warm-up ramp has been reset. Confirm the linked phone\'s WhatsApp is not showing a ban/restriction notice before re-scanning, and call POST /resume only after that.';
+                    savePersistedState();
+                    const COOLDOWN_MS = Number(process.env.WHATSAPP_FORCED_LOGOUT_COOLDOWN_MS) || 30 * 60 * 1000; // 30 min
+                    console.error(`[WhatsApp] Forced session removal detected — NOT auto-retrying. Waiting ${Math.round(COOLDOWN_MS / 60000)} min before even generating a new QR. Circuit breaker is open; check the account before POST /resume.`);
+                    fs.rm(AUTH_PATH, { recursive: true, force: true }, () => {
+                        setTimeout(() => {
+                            console.log('[WhatsApp] Cooldown elapsed — generating a new QR (sending stays paused until /resume).');
+                            initWhatsApp();
+                        }, COOLDOWN_MS);
+                    });
+                } else if (loggedOut) {
                     // Session is no longer valid server-side (e.g. removed
                     // from Linked Devices on the phone). Wipe local creds so
                     // the next initWhatsApp() cleanly generates a new QR
@@ -302,15 +501,54 @@ async function processQueue() {
             break; // the setInterval nudge below will resume this once we're back in-window
         }
 
-        if (!checkAndBumpDailyLimit()) {
-            console.warn(`[WhatsApp] Daily limit of ${DAILY_LIMIT} reached — remaining ${messageQueue.length} message(s) stay queued until tomorrow.`);
-            break; // leave the rest in the queue; will resume once the date rolls over
+        const todayKey = new Date().toDateString();
+        if (todayKey !== dailyDateKey) {
+            dailyDateKey = todayKey;
+            dailyCount = 0;
+            savePersistedState();
         }
 
-        const { to, text } = messageQueue.shift();
-        try {
-            const jid = to + '@s.whatsapp.net';
+        const effLimit = effectiveDailyLimit();
+        if (dailyCount >= effLimit) {
+            const reason = effLimit < DAILY_LIMIT ? `warm-up ramp cap (${effLimit}/day, day ${Math.floor((Date.now() - firstLinkDate) / 86400000) + 1} of ${WARMUP_DAYS})` : `daily limit of ${DAILY_LIMIT}`;
+            console.warn(`[WhatsApp] ${reason} reached — remaining ${messageQueue.length} message(s) stay queued until tomorrow.`);
+            break;
+        }
 
+        // Real ban-risk signal check: if most recent judgable sends are
+        // going unread, pause proactively rather than keep pushing more
+        // messages into an account that's already showing the pattern
+        // WhatsApp's models flag hardest (proactive messages to strangers
+        // that never get engagement).
+        const unreadRatio = currentUnreadRatio();
+        if (unreadRatio !== null && unreadRatio >= UNREAD_RATIO_ALERT_THRESHOLD) {
+            circuitBroken = true;
+            circuitBrokenReason = `${Math.round(unreadRatio * 100)}% of recent messages are going unread — this is the strongest real ban-risk signal (unanswered-message tracking), independent of send speed. Pausing before WhatsApp's own systems flag the account. Check numbers/content before POST /resume.`;
+            console.error(`[WhatsApp] CIRCUIT BREAKER TRIPPED — ${circuitBrokenReason}`);
+            break;
+        }
+
+        const { to, text } = messageQueue[0];
+        const jid = to + '@s.whatsapp.net';
+
+        // Per-recipient minimum gap — don't message the same person twice
+        // within MIN_RECIPIENT_GAP_MS. Requeue to the back rather than drop.
+        const lastSentToThem = recipientHistory[jid];
+        if (lastSentToThem && Date.now() - lastSentToThem < MIN_RECIPIENT_GAP_MS) {
+            messageQueue.shift();
+            messageQueue.push({ to, text });
+            if (messageQueue.every(m => {
+                const last = recipientHistory[m.to + '@s.whatsapp.net'];
+                return last && Date.now() - last < MIN_RECIPIENT_GAP_MS;
+            })) {
+                console.log('[WhatsApp] Everyone left in queue was messaged too recently — pausing until gaps clear.');
+                break;
+            }
+            continue;
+        }
+        messageQueue.shift();
+
+        try {
             if (SIMULATE_TYPING) {
                 // Briefly show "typing..." before sending — a bot that never
                 // does this is an easy behavioural tell vs. a human sender.
@@ -321,8 +559,13 @@ async function processQueue() {
                 } catch (_) { /* presence errors are non-fatal, just skip the flourish */ }
             }
 
-            await sock.sendMessage(jid, { text });
-            console.log(`[WhatsApp] Sent to ${to} (${dailyCount}/${DAILY_LIMIT} today)`);
+            const result = await sock.sendMessage(jid, { text });
+            dailyCount++;
+            recipientHistory[jid] = Date.now();
+            sentLog.push({ jid, msgId: result?.key?.id || null, sentAt: Date.now(), status: 'sent' });
+            pruneSentLog();
+            savePersistedState();
+            console.log(`[WhatsApp] Sent to ${to} (${dailyCount}/${effLimit} today${effLimit < DAILY_LIMIT ? ', warm-up' : ''})`);
             consecutiveFailures = 0; // any clean send resets the breaker counter
         } catch (err) {
             console.error(`[WhatsApp] Failed to send to ${to}:`, err.message);
@@ -343,13 +586,13 @@ async function processQueue() {
         if (messageQueue.length === 0) break;
 
         if (sentInThisBatch >= currentBatchTarget) {
-            const pause = randomDelay(BATCH_PAUSE_MIN_MS, BATCH_PAUSE_MAX_MS);
+            const pause = gaussianDelay(BATCH_PAUSE_MIN_MS, BATCH_PAUSE_MAX_MS);
             console.log(`[WhatsApp] Batch of ${sentInThisBatch} done — pausing ${Math.round(pause / 1000)}s before continuing (looks less bot-like than nonstop sending).`);
             await new Promise(resolve => setTimeout(resolve, pause));
             sentInThisBatch = 0;
             currentBatchTarget = randomBatchSize(); // re-randomize so batch size isn't a fixed, detectable pattern
         } else {
-            await new Promise(resolve => setTimeout(resolve, randomDelay(MIN_DELAY_MS, MAX_DELAY_MS)));
+            await new Promise(resolve => setTimeout(resolve, gaussianDelay(MIN_DELAY_MS, MAX_DELAY_MS)));
         }
     }
     isProcessing = false;
@@ -378,6 +621,7 @@ app.get('/status', requireApiKey, (req, res) => {
         dailyDateKey = todayKey;
         dailyCount = 0;
     }
+    const unreadRatio = currentUnreadRatio();
     res.json({
         available: !!makeWASocket,
         ready: isReady,
@@ -387,8 +631,12 @@ app.get('/status', requireApiKey, (req, res) => {
         hasQr: !!lastQrDataUrl,
         sentToday: dailyCount,
         dailyLimit: DAILY_LIMIT,
+        effectiveDailyLimitToday: effectiveDailyLimit(),
+        warmupActive: effectiveDailyLimit() < DAILY_LIMIT,
+        firstLinkDate: firstLinkDate ? new Date(firstLinkDate).toISOString() : null,
         withinSendingWindow: isWithinSendingWindow(),
         quietHours: QUIET_HOURS_ENABLED ? `${QUIET_HOURS_START}:00–${QUIET_HOURS_END}:00` : 'disabled',
+        unreadRatio: unreadRatio === null ? 'not enough data yet' : Math.round(unreadRatio * 100) + '%',
         circuitBroken,
         circuitBrokenReason,
     });
