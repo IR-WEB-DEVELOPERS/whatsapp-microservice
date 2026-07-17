@@ -2,15 +2,18 @@
  * whatsapp-microservice/server.js — Padmavani School Dashboard
  *
  * Standalone WhatsApp sender service. Deploy this as its OWN Render web
- * service (separate from the main dashboard). It runs whatsapp-web.js
- * (Puppeteer/Chromium — the heavy part) so the main dashboard service no
- * longer needs to carry that CPU/RAM cost.
+ * service (separate from the main dashboard). It runs Baileys — a direct
+ * WebSocket client for WhatsApp Web with NO browser/Chromium involved — so
+ * RAM usage stays low (roughly 50-100MB), comfortably inside Render's 512MB
+ * free tier. (Previously this ran whatsapp-web.js/Puppeteer, which needed a
+ * full headless Chromium and much more RAM — see server.js.wwebjs.bak for
+ * that version.)
  *
  * The main dashboard talks to this service over plain HTTPS using a shared
  * API key (see .env.example). No Supabase / DB access happens here — this
  * service only knows how to send whatever text it's told to send.
  *
- * Endpoints:
+ * Endpoints (UNCHANGED — the dashboard side needs zero changes):
  *   GET  /health            — public, no auth. Use as Render health check /
  *                              uptime ping to prevent free-tier spin-down.
  *   GET  /status             — auth required. { available, ready, initializing, queueLength, isProcessing, hasQr }
@@ -22,22 +25,33 @@
 
 require('dotenv').config();
 
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
-let Client, LocalAuth, QRCode;
+let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Boom, pino, QRCode;
 try {
-    ({ Client, LocalAuth } = require('whatsapp-web.js'));
+    ({
+        default: makeWASocket,
+        useMultiFileAuthState,
+        DisconnectReason,
+        fetchLatestBaileysVersion,
+    } = require('@whiskeysockets/baileys'));
+    ({ Boom } = require('@hapi/boom'));
+    pino = require('pino');
     QRCode = require('qrcode');
 } catch (e) {
-    console.warn('[WhatsApp] whatsapp-web.js / qrcode not installed. Run `npm install`.');
+    console.warn('[WhatsApp] @whiskeysockets/baileys / qrcode not installed. Run `npm install`.', e.message);
 }
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.WHATSAPP_API_KEY;
+// NOTE: renamed from WWEBJS_AUTH_PATH. Baileys writes several small JSON
+// files (creds + signal keys) into this folder rather than one profile dir.
+const AUTH_PATH = process.env.WHATSAPP_AUTH_PATH || process.env.WWEBJS_AUTH_PATH || '.baileys_auth';
 
 if (!API_KEY) {
     console.warn('[WhatsApp] WARNING: WHATSAPP_API_KEY is not set — every protected endpoint will reject requests. Set it in your environment.');
@@ -59,7 +73,7 @@ function requireApiKey(req, res, next) {
 }
 
 // ─── WhatsApp client state ─────────────────────────────────────────────────
-let client = null;
+let sock = null;
 let isReady = false;
 let isInitializing = false;
 let lastQrDataUrl = null;
@@ -67,125 +81,109 @@ let messageQueue = [];
 let isProcessing = false;
 const SEND_DELAY_MS = 2000; // avoid WhatsApp rate limits / bans
 
-function initWhatsApp() {
-    if (!Client) return null;
-    if (client || isInitializing) return client;
+const logger = pino ? pino({ level: process.env.BAILEYS_LOG_LEVEL || 'error' }) : undefined;
+
+async function initWhatsApp() {
+    if (!makeWASocket) return null;
+    if (sock || isInitializing) return sock;
     isInitializing = true;
 
-    client = new Client({
-        authStrategy: new LocalAuth({ dataPath: process.env.WWEBJS_AUTH_PATH || '.wwebjs_auth' }),
-        qrMaxRetries: 5,
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--no-zygote',
-                // NOTE: --single-process removed — it saves RAM but makes
-                // Chromium noticeably less stable during the heavy first-time
-                // chat sync right after scanning, which is exactly when we
-                // saw phones show "device added" while the server-side
-                // session silently died before 'ready'.
-            ],
-        },
-        // WhatsApp's servers sometimes reject the linking handshake ("Couldn't
-        // link device, try again") when Puppeteer's bundled Chromium reports
-        // an old/mismatched User-Agent. Pinning a current desktop Chrome UA
-        // here has fixed this for most whatsapp-web.js users hitting that error.
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    });
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
+        const { version } = await fetchLatestBaileysVersion();
 
-    // ── Watchdog ──────────────────────────────────────────────────────────
-    // On RAM-constrained hosts (e.g. Render free/starter tier), Chromium can
-    // silently hang while launching (never fires 'qr', 'ready', 'auth_failure'
-    // OR 'disconnected') — status gets stuck on "Connecting..." forever. If
-    // none of those fire within WATCHDOG_MS, force-kill and retry from
-    // scratch instead of hanging indefinitely.
-    let hasAuthenticated = false;
-    const WATCHDOG_MS = 90 * 1000;
-    const watchdogClient = client;
-    setTimeout(() => {
-        if (client !== watchdogClient) return; // already progressed/replaced normally
-        if (isReady || lastQrDataUrl || hasAuthenticated) return; // got somewhere — leave it alone
-        console.warn('[WhatsApp] Client init stuck for', WATCHDOG_MS / 1000, 's with no progress — restarting.');
-        isInitializing = false;
-        client = null;
-        watchdogClient.destroy().catch(() => {});
-        initWhatsApp();
-    }, WATCHDOG_MS);
-
-    client.on('loading_screen', (percent, message) => {
-        console.log(`[WhatsApp] Loading chats: ${percent}% — ${message}`);
-    });
-
-    client.on('ready', () => {
-        isReady = true;
-        isInitializing = false;
-        lastQrDataUrl = null;
-        console.log('[WhatsApp] Client is ready!');
-        processQueue();
-    });
-
-    client.on('authenticated', () => {
-        hasAuthenticated = true;
-        console.log('[WhatsApp] Authenticated successfully — syncing chats, this can take a couple of minutes on first link.');
-    });
-
-    client.on('auth_failure', (msg) => {
-        console.error('[WhatsApp] Authentication failed:', msg);
-        // Previously this only flipped flags and left the dead client object
-        // in place, so initWhatsApp()'s `if (client) return` meant nothing
-        // ever retried — status got stuck showing a stale/invalid QR forever
-        // even though the phone had already added the device. Recover the
-        // same way 'disconnected' does: fully reset and retry.
-        isReady = false;
-        isInitializing = false;
-        hasAuthenticated = false;
-        lastQrDataUrl = null;
-        const oldClient = client;
-        client = null;
-        setTimeout(() => {
-            console.log('[WhatsApp] Retrying after auth failure...');
-            oldClient.destroy().catch(() => {});
-            initWhatsApp();
-        }, 3000);
-    });
-
-    client.on('disconnected', (reason) => {
-        console.warn('[WhatsApp] Client disconnected:', reason);
-        isReady = false;
-        isInitializing = false;
-        hasAuthenticated = false;
-        lastQrDataUrl = null;
-        const oldClient = client;
-        client = null;
-        setTimeout(() => {
-            console.log('[WhatsApp] Attempting to reconnect...');
-            oldClient.destroy().catch(() => {});
-            initWhatsApp();
-        }, 5000);
-    });
-
-    client.on('qr', (qr) => {
-        console.log('[WhatsApp] New QR code generated — scan it via GET /qr (with x-api-key header) or check the logs below.');
-        QRCode.toString(qr, { type: 'terminal', small: true }, (err, qrTerm) => {
-            if (!err) console.log(qrTerm);
+        const newSock = makeWASocket({
+            version,
+            auth: state,
+            logger,
+            // We render our own QR (as a data URL via GET /qr), no need for
+            // Baileys to also dump it to the terminal.
+            printQRInTerminal: false,
+            browser: ['Padmavani School Dashboard', 'Chrome', '126.0.0.0'],
         });
-        QRCode.toDataURL(qr, (err, dataUrl) => {
-            if (!err) lastQrDataUrl = dataUrl;
-        });
-    });
+        sock = newSock;
 
-    client.initialize().catch(err => {
+        // ── Watchdog ──────────────────────────────────────────────────────
+        // On RAM-constrained hosts (e.g. Render free/starter tier), the
+        // socket can occasionally hang while the WebSocket handshake or
+        // initial sync stalls — status gets stuck on "Connecting..."
+        // forever. If neither a QR nor an open connection shows up within
+        // WATCHDOG_MS, force-close and retry from scratch.
+        const WATCHDOG_MS = 60 * 1000;
+        const watchdogSock = newSock;
+        setTimeout(() => {
+            if (sock !== watchdogSock) return; // already progressed/replaced normally
+            if (isReady || lastQrDataUrl) return; // got somewhere — leave it alone
+            console.warn('[WhatsApp] Client init stuck for', WATCHDOG_MS / 1000, 's with no progress — restarting.');
+            isInitializing = false;
+            sock = null;
+            try { watchdogSock.end(new Error('watchdog timeout')); } catch (_) {}
+            initWhatsApp();
+        }, WATCHDOG_MS);
+
+        newSock.ev.on('creds.update', saveCreds);
+
+        newSock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                console.log('[WhatsApp] New QR code generated — scan it via GET /qr (with x-api-key header) or check the logs below.');
+                QRCode.toString(qr, { type: 'terminal', small: true }, (err, qrTerm) => {
+                    if (!err) console.log(qrTerm);
+                });
+                QRCode.toDataURL(qr, (err, dataUrl) => {
+                    if (!err) lastQrDataUrl = dataUrl;
+                });
+            }
+
+            if (connection === 'open') {
+                isReady = true;
+                isInitializing = false;
+                lastQrDataUrl = null;
+                console.log('[WhatsApp] Client is ready!');
+                processQueue();
+            }
+
+            if (connection === 'close') {
+                isReady = false;
+                isInitializing = false;
+                lastQrDataUrl = null;
+
+                const statusCode = lastDisconnect?.error instanceof Boom
+                    ? lastDisconnect.error.output?.statusCode
+                    : lastDisconnect?.error?.output?.statusCode;
+                const loggedOut = statusCode === DisconnectReason.loggedOut;
+
+                console.warn('[WhatsApp] Connection closed:', lastDisconnect?.error?.message || 'unknown reason', loggedOut ? '(logged out — will need a fresh QR scan)' : '(will attempt reconnect)');
+
+                sock = null;
+
+                if (loggedOut) {
+                    // Session is no longer valid server-side (e.g. removed
+                    // from Linked Devices on the phone). Wipe local creds so
+                    // the next initWhatsApp() cleanly generates a new QR
+                    // instead of retrying with dead credentials forever.
+                    fs.rm(AUTH_PATH, { recursive: true, force: true }, () => {
+                        setTimeout(() => {
+                            console.log('[WhatsApp] Retrying after logout with a fresh session...');
+                            initWhatsApp();
+                        }, 3000);
+                    });
+                } else {
+                    setTimeout(() => {
+                        console.log('[WhatsApp] Attempting to reconnect...');
+                        initWhatsApp();
+                    }, 5000);
+                }
+            }
+        });
+    } catch (err) {
         console.error('[WhatsApp] Failed to initialize client:', err.message);
         isInitializing = false;
-    });
+        sock = null;
+    }
 
-    return client;
+    return sock;
 }
 
 async function processQueue() {
@@ -195,8 +193,8 @@ async function processQueue() {
     while (messageQueue.length > 0) {
         const { to, text } = messageQueue.shift();
         try {
-            const chatId = to + '@c.us';
-            await client.sendMessage(chatId, text);
+            const jid = to + '@s.whatsapp.net';
+            await sock.sendMessage(jid, { text });
             console.log(`[WhatsApp] Sent to ${to}`);
         } catch (err) {
             console.error(`[WhatsApp] Failed to send to ${to}:`, err.message);
@@ -225,7 +223,7 @@ app.get('/health', (req, res) => {
 
 app.get('/status', requireApiKey, (req, res) => {
     res.json({
-        available: !!Client,
+        available: !!makeWASocket,
         ready: isReady,
         initializing: isInitializing,
         queueLength: messageQueue.length,
@@ -240,8 +238,8 @@ app.get('/qr', requireApiKey, (req, res) => {
 
 app.post('/send', requireApiKey, (req, res) => {
     const { to, text } = req.body || {};
-    if (!Client) return res.json({ queued: false, reason: 'whatsapp-web.js not installed' });
-    if (!client) initWhatsApp();
+    if (!makeWASocket) return res.json({ queued: false, reason: '@whiskeysockets/baileys not installed' });
+    if (!sock) initWhatsApp();
 
     const clean = normalizeNumber(to);
     if (!clean || !text) return res.status(400).json({ queued: false, reason: 'invalid to/text' });
@@ -253,8 +251,8 @@ app.post('/send', requireApiKey, (req, res) => {
 
 app.post('/send-bulk', requireApiKey, (req, res) => {
     const { numbers, text } = req.body || {};
-    if (!Client) return res.json({ queued: 0, reason: 'whatsapp-web.js not installed' });
-    if (!client) initWhatsApp();
+    if (!makeWASocket) return res.json({ queued: 0, reason: '@whiskeysockets/baileys not installed' });
+    if (!sock) initWhatsApp();
 
     if (!Array.isArray(numbers) || numbers.length === 0 || !text) {
         return res.status(400).json({ queued: 0, reason: 'invalid numbers/text' });
@@ -274,15 +272,16 @@ app.post('/send-bulk', requireApiKey, (req, res) => {
 
 app.post('/logout', requireApiKey, async (req, res) => {
     try {
-        if (client) {
-            await client.logout().catch(() => {});
-            await client.destroy().catch(() => {});
+        if (sock) {
+            await sock.logout().catch(() => {});
         }
-        client = null;
+        sock = null;
         isReady = false;
         isInitializing = false;
         lastQrDataUrl = null;
-        setTimeout(initWhatsApp, 1000);
+        fs.rm(AUTH_PATH, { recursive: true, force: true }, () => {
+            setTimeout(initWhatsApp, 1000);
+        });
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ ok: false, error: err.message });
