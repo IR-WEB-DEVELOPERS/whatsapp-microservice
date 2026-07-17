@@ -31,19 +31,27 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
+// @whiskeysockets/baileys ships as a pure ESM package ("type": "module"),
+// so it must be loaded with a dynamic import() rather than require() — a
+// plain require() only happens to work on Node 22+, which can transparently
+// require() ESM, but breaks on Node 20 (what Render's .node-version pins)
+// with "require() of ES Module ... not supported". loadBaileysDeps() runs
+// once before the server starts accepting traffic (see the boot section at
+// the bottom of this file).
 let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Boom, pino, QRCode;
-try {
-    ({
-        default: makeWASocket,
-        useMultiFileAuthState,
-        DisconnectReason,
-        fetchLatestBaileysVersion,
-    } = require('@whiskeysockets/baileys'));
-    ({ Boom } = require('@hapi/boom'));
-    pino = require('pino');
-    QRCode = require('qrcode');
-} catch (e) {
-    console.warn('[WhatsApp] @whiskeysockets/baileys / qrcode not installed. Run `npm install`.', e.message);
+
+async function loadBaileysDeps() {
+    try {
+        const baileys = await import('@whiskeysockets/baileys');
+        makeWASocket = baileys.default;
+        ({ useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys);
+        ({ Boom } = require('@hapi/boom'));
+        pino = require('pino');
+        QRCode = require('qrcode');
+        logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'error' });
+    } catch (e) {
+        console.warn('[WhatsApp] @whiskeysockets/baileys / qrcode not installed. Run `npm install`.', e.message);
+    }
 }
 
 const app = express();
@@ -81,7 +89,7 @@ let messageQueue = [];
 let isProcessing = false;
 const SEND_DELAY_MS = 2000; // avoid WhatsApp rate limits / bans
 
-const logger = pino ? pino({ level: process.env.BAILEYS_LOG_LEVEL || 'error' }) : undefined;
+let logger; // created once pino has been loaded — see loadBaileysDeps()
 
 async function initWhatsApp() {
     if (!makeWASocket) return null;
@@ -289,12 +297,16 @@ app.post('/logout', requireApiKey, async (req, res) => {
 });
 
 // ─── Boot ───────────────────────────────────────────────────────────────────
-try {
-    initWhatsApp();
-} catch (err) {
-    console.error('[WhatsApp] Could not start client on boot:', err.message);
-}
+(async () => {
+    await loadBaileysDeps();
 
-app.listen(PORT, () => {
-    console.log(`[WhatsApp Microservice] Listening on port ${PORT}`);
-});
+    try {
+        await initWhatsApp();
+    } catch (err) {
+        console.error('[WhatsApp] Could not start client on boot:', err.message);
+    }
+
+    app.listen(PORT, () => {
+        console.log(`[WhatsApp Microservice] Listening on port ${PORT}`);
+    });
+})();
