@@ -74,15 +74,44 @@ function initWhatsApp() {
 
     client = new Client({
         authStrategy: new LocalAuth({ dataPath: process.env.WWEBJS_AUTH_PATH || '.wwebjs_auth' }),
+        qrMaxRetries: 5,
         puppeteer: {
             headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--no-zygote',
+                '--single-process', // fewer Chromium processes = lower peak RAM; important on 512MB Render instances
             ],
         },
+        // WhatsApp's servers sometimes reject the linking handshake ("Couldn't
+        // link device, try again") when Puppeteer's bundled Chromium reports
+        // an old/mismatched User-Agent. Pinning a current desktop Chrome UA
+        // here has fixed this for most whatsapp-web.js users hitting that error.
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     });
+
+    // ── Watchdog ──────────────────────────────────────────────────────────
+    // On RAM-constrained hosts (e.g. Render free/starter tier), Chromium can
+    // silently hang while launching (never fires 'qr', 'ready', 'auth_failure'
+    // OR 'disconnected') — status gets stuck on "Connecting..." forever. If
+    // none of those fire within WATCHDOG_MS, force-kill and retry from
+    // scratch instead of hanging indefinitely.
+    const WATCHDOG_MS = 90 * 1000;
+    const watchdogClient = client;
+    setTimeout(() => {
+        if (client !== watchdogClient) return; // already progressed/replaced normally
+        if (isReady || lastQrDataUrl) return;   // got somewhere — leave it alone
+        console.warn('[WhatsApp] Client init stuck for', WATCHDOG_MS / 1000, 's with no progress — restarting.');
+        isInitializing = false;
+        client = null;
+        watchdogClient.destroy().catch(() => {});
+        initWhatsApp();
+    }, WATCHDOG_MS);
 
     client.on('ready', () => {
         isReady = true;
