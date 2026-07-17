@@ -208,8 +208,8 @@ const UNREAD_RATIO_ALERT_THRESHOLD = Number(process.env.WHATSAPP_UNREAD_RATIO_TH
 // circuit breaker that stops everything if WhatsApp starts throwing
 // errors that look like a rate-limit/ban response. Slower + safer, by
 // design, over fast + risky.
-const MIN_DELAY_MS = Number(process.env.WHATSAPP_MIN_DELAY_MS) || 10000;  // lower bound per-message gap (10s)
-const MAX_DELAY_MS = Number(process.env.WHATSAPP_MAX_DELAY_MS) || 20000;  // upper bound per-message gap (20s)
+const MIN_DELAY_MS = Number(process.env.WHATSAPP_MIN_DELAY_MS) || 20000;  // lower bound per-message gap (20s)
+const MAX_DELAY_MS = Number(process.env.WHATSAPP_MAX_DELAY_MS) || 30000;  // upper bound per-message gap (30s)
 const BATCH_SIZE_MIN = Number(process.env.WHATSAPP_BATCH_SIZE_MIN) || 10; // randomized batch size lower bound
 const BATCH_SIZE_MAX = Number(process.env.WHATSAPP_BATCH_SIZE_MAX) || 15; // randomized batch size upper bound
 const BATCH_PAUSE_MIN_MS = Number(process.env.WHATSAPP_BATCH_PAUSE_MIN_MS) || 180000; // 3 min
@@ -276,18 +276,22 @@ function looksLikeBanSignal(message) {
 let dailyCount = persisted.dailyCount || 0;
 let dailyDateKey = persisted.dailyDateKey || new Date().toDateString();
 
-// ── Warm-up ramp ────────────────────────────────────────────────────────
+// ── Warm-up ramp (OFF by default — see note below) ─────────────────────────
 // A number that starts sending 150/day from the moment it's linked (or
 // re-linked after a ban/logout) looks nothing like organic usage growth,
-// which is itself a signal. Ramp the effective daily cap up over the first
-// few weeks of this number's automation history instead of using DAILY_LIMIT
-// at full strength immediately. Community "warming" practice: ramp slowly
-// over 2-4 weeks — not an official Meta guarantee, just materially less
-// abrupt than going full-volume on day one.
-const WARMUP_DAYS = Number(process.env.WHATSAPP_WARMUP_DAYS) || 21;
+// which is itself a signal. Ramping the effective daily cap up over the
+// first few weeks reduces that specific signal — but it was disabled here
+// at the client's request because it slowed down day-one sending too much
+// for production use. Turning it off does NOT remove ban risk — it only
+// removes this one mitigation. The underlying risk drivers (unofficial
+// client, cold/no-reply broadcast pattern) are unchanged; see the
+// unread-ratio circuit breaker below, which still applies regardless of
+// this setting. Set WHATSAPP_WARMUP_DAYS to a positive number to re-enable.
+const WARMUP_DAYS = Number(process.env.WHATSAPP_WARMUP_DAYS) || 0;
 const WARMUP_START_LIMIT = Number(process.env.WHATSAPP_WARMUP_START_LIMIT) || 15;
 
 function effectiveDailyLimit() {
+    if (WARMUP_DAYS <= 0) return DAILY_LIMIT; // warm-up disabled — full limit from day one
     if (!firstLinkDate) return WARMUP_START_LIMIT; // haven't even confirmed a stable link yet — stay minimal
     const daysSinceLink = (Date.now() - firstLinkDate) / (24 * 60 * 60 * 1000);
     if (daysSinceLink >= WARMUP_DAYS) return DAILY_LIMIT;
@@ -607,6 +611,32 @@ function normalizeNumber(raw) {
     return null;
 }
 
+// A parent with two (or more) children generates two separate /send calls
+// with different content (e.g. two different students' marks) to the SAME
+// phone number, often within seconds of each other. Without this, the
+// second call becomes a second queue entry, which then hits the per-
+// recipient minimum gap (MIN_RECIPIENT_GAP_MS) and sits queued for hours —
+// not because it's spam, but because the gap logic can't tell "same parent,
+// different legitimate reason" apart from "sending to the same stranger
+// twice". Merging any pending (not-yet-sent) entries for the same number
+// into one combined message sidesteps the gap check entirely (it's genuinely
+// one send) and is also better anti-ban behaviour — one message beats two
+// closely-timed ones to the same recipient either way.
+function queueMessage(to, rawText) {
+    const pending = messageQueue.find(m => m.to === to);
+    if (pending) {
+        // Strip any already-appended reply prompt before merging so it
+        // doesn't end up duplicated mid-message; re-add it once at the end.
+        const promptTrimmed = REPLY_PROMPT_TEXT.trim();
+        const existingBare = pending.text.endsWith(promptTrimmed)
+            ? pending.text.slice(0, pending.text.length - promptTrimmed.length).trimEnd()
+            : pending.text;
+        pending.text = withReplyPrompt(existingBare + '\n\n' + rawText);
+    } else {
+        messageQueue.push({ to, text: withReplyPrompt(rawText) });
+    }
+}
+
 // ─── Reply-engagement prompt ───────────────────────────────────────────────
 // True tappable WhatsApp buttons are a Business API feature; sending them
 // through an unofficial personal-account client (Baileys) either silently
@@ -673,7 +703,7 @@ app.post('/send', requireApiKey, (req, res) => {
     const clean = normalizeNumber(to);
     if (!clean || !text) return res.status(400).json({ queued: false, reason: 'invalid to/text' });
 
-    messageQueue.push({ to: clean, text: withReplyPrompt(text) });
+    queueMessage(clean, text);
     if (isReady && !isProcessing) processQueue();
     res.json({ queued: true });
 });
@@ -687,17 +717,17 @@ app.post('/send-bulk', requireApiKey, (req, res) => {
         return res.status(400).json({ queued: 0, reason: 'invalid numbers/text' });
     }
 
-    const finalText = withReplyPrompt(text);
-    let queued = 0;
+    // Same identical announcement to many numbers — dedupe (no need to
+    // merge text since it's the same message), so one parent number in the
+    // list doesn't get queued twice for one broadcast.
+    const uniqueClean = new Set();
     numbers.forEach(num => {
         const clean = normalizeNumber(num);
-        if (clean) {
-            messageQueue.push({ to: clean, text: finalText });
-            queued++;
-        }
+        if (clean) uniqueClean.add(clean);
     });
+    uniqueClean.forEach(clean => queueMessage(clean, text));
     if (isReady && !isProcessing) processQueue();
-    res.json({ queued });
+    res.json({ queued: uniqueClean.size });
 });
 
 // Manual reset for the circuit breaker (see CIRCUIT_BREAKER_THRESHOLD above).
