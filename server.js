@@ -607,6 +607,24 @@ function normalizeNumber(raw) {
     return null;
 }
 
+// ─── Reply-engagement prompt ───────────────────────────────────────────────
+// True tappable WhatsApp buttons are a Business API feature; sending them
+// through an unofficial personal-account client (Baileys) either silently
+// fails to render on the recipient's side or reads as an account trying to
+// impersonate Business API behaviour — both bad. A plain, low-friction text
+// prompt is the reliable substitute: it doesn't need special rendering and
+// still drives the reply that matters for the engagement/ban-risk signal
+// (see messages.upsert handler above, which tracks the actual reply).
+const APPEND_REPLY_PROMPT = process.env.WHATSAPP_APPEND_REPLY_PROMPT !== 'false'; // on by default
+const REPLY_PROMPT_TEXT = process.env.WHATSAPP_REPLY_PROMPT_TEXT
+    || '\n\n_ఈ మెసేజ్ అందిందని నిర్ధారించడానికి "OK" అని రిప్లై చేయండి._';
+
+function withReplyPrompt(text) {
+    if (!APPEND_REPLY_PROMPT) return text;
+    if (!text || text.includes(REPLY_PROMPT_TEXT.trim())) return text; // don't double-append
+    return text + REPLY_PROMPT_TEXT;
+}
+
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
@@ -637,6 +655,7 @@ app.get('/status', requireApiKey, (req, res) => {
         withinSendingWindow: isWithinSendingWindow(),
         quietHours: QUIET_HOURS_ENABLED ? `${QUIET_HOURS_START}:00–${QUIET_HOURS_END}:00` : 'disabled',
         unreadRatio: unreadRatio === null ? 'not enough data yet' : Math.round(unreadRatio * 100) + '%',
+        replyPromptEnabled: APPEND_REPLY_PROMPT,
         circuitBroken,
         circuitBrokenReason,
     });
@@ -654,7 +673,7 @@ app.post('/send', requireApiKey, (req, res) => {
     const clean = normalizeNumber(to);
     if (!clean || !text) return res.status(400).json({ queued: false, reason: 'invalid to/text' });
 
-    messageQueue.push({ to: clean, text });
+    messageQueue.push({ to: clean, text: withReplyPrompt(text) });
     if (isReady && !isProcessing) processQueue();
     res.json({ queued: true });
 });
@@ -668,11 +687,12 @@ app.post('/send-bulk', requireApiKey, (req, res) => {
         return res.status(400).json({ queued: 0, reason: 'invalid numbers/text' });
     }
 
+    const finalText = withReplyPrompt(text);
     let queued = 0;
     numbers.forEach(num => {
         const clean = normalizeNumber(num);
         if (clean) {
-            messageQueue.push({ to: clean, text });
+            messageQueue.push({ to: clean, text: finalText });
             queued++;
         }
     });
