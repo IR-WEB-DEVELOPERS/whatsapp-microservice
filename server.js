@@ -85,7 +85,11 @@ function initWhatsApp() {
                 '--disable-extensions',
                 '--disable-background-networking',
                 '--no-zygote',
-                '--single-process', // fewer Chromium processes = lower peak RAM; important on 512MB Render instances
+                // NOTE: --single-process removed — it saves RAM but makes
+                // Chromium noticeably less stable during the heavy first-time
+                // chat sync right after scanning, which is exactly when we
+                // saw phones show "device added" while the server-side
+                // session silently died before 'ready'.
             ],
         },
         // WhatsApp's servers sometimes reject the linking handshake ("Couldn't
@@ -101,17 +105,22 @@ function initWhatsApp() {
     // OR 'disconnected') — status gets stuck on "Connecting..." forever. If
     // none of those fire within WATCHDOG_MS, force-kill and retry from
     // scratch instead of hanging indefinitely.
+    let hasAuthenticated = false;
     const WATCHDOG_MS = 90 * 1000;
     const watchdogClient = client;
     setTimeout(() => {
         if (client !== watchdogClient) return; // already progressed/replaced normally
-        if (isReady || lastQrDataUrl) return;   // got somewhere — leave it alone
+        if (isReady || lastQrDataUrl || hasAuthenticated) return; // got somewhere — leave it alone
         console.warn('[WhatsApp] Client init stuck for', WATCHDOG_MS / 1000, 's with no progress — restarting.');
         isInitializing = false;
         client = null;
         watchdogClient.destroy().catch(() => {});
         initWhatsApp();
     }, WATCHDOG_MS);
+
+    client.on('loading_screen', (percent, message) => {
+        console.log(`[WhatsApp] Loading chats: ${percent}% — ${message}`);
+    });
 
     client.on('ready', () => {
         isReady = true;
@@ -122,19 +131,36 @@ function initWhatsApp() {
     });
 
     client.on('authenticated', () => {
-        console.log('[WhatsApp] Authenticated successfully.');
+        hasAuthenticated = true;
+        console.log('[WhatsApp] Authenticated successfully — syncing chats, this can take a couple of minutes on first link.');
     });
 
     client.on('auth_failure', (msg) => {
         console.error('[WhatsApp] Authentication failed:', msg);
+        // Previously this only flipped flags and left the dead client object
+        // in place, so initWhatsApp()'s `if (client) return` meant nothing
+        // ever retried — status got stuck showing a stale/invalid QR forever
+        // even though the phone had already added the device. Recover the
+        // same way 'disconnected' does: fully reset and retry.
         isReady = false;
         isInitializing = false;
+        hasAuthenticated = false;
+        lastQrDataUrl = null;
+        const oldClient = client;
+        client = null;
+        setTimeout(() => {
+            console.log('[WhatsApp] Retrying after auth failure...');
+            oldClient.destroy().catch(() => {});
+            initWhatsApp();
+        }, 3000);
     });
 
     client.on('disconnected', (reason) => {
         console.warn('[WhatsApp] Client disconnected:', reason);
         isReady = false;
         isInitializing = false;
+        hasAuthenticated = false;
+        lastQrDataUrl = null;
         const oldClient = client;
         client = null;
         setTimeout(() => {
