@@ -1,7 +1,7 @@
 {
   "name": "padmavani-whatsapp-microservice",
-  "version": "1.0.0",
-  "description": "Standalone WhatsApp sender for Padmavani School Dashboard — runs whatsapp-web.js on its own Render service, separate from the main dashboard, so the main service stays light on the free tier.",
+  "version": "2.0.0",
+  "description": "Standalone WhatsApp sender for Padmavani School Dashboard — runs Baileys (no browser/Chromium) on its own Render service, separate from the main dashboard, so RAM usage stays low enough for the free tier.",
   "main": "server.js",
   "engines": {
     "node": "20.x"
@@ -16,7 +16,9 @@
     "helmet": "^8.1.0",
     "express-rate-limit": "^7.5.0",
     "qrcode": "^1.5.4",
-    "whatsapp-web.js": "^1.26.0"
+    "@whiskeysockets/baileys": "6.7.22",
+    "@hapi/boom": "^9.1.3",
+    "pino": "^9.6.0"
   },
   "license": "ISC"
 }
