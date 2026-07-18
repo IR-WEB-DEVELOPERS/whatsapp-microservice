@@ -224,9 +224,24 @@ const QUIET_HOURS_ENABLED = process.env.WHATSAPP_QUIET_HOURS_ENABLED !== 'false'
 const QUIET_HOURS_START = Number(process.env.WHATSAPP_QUIET_HOURS_START) || 9;  // 9 AM
 const QUIET_HOURS_END = Number(process.env.WHATSAPP_QUIET_HOURS_END) || 19;     // 7 PM
 
+function getISTDateKey() {
+    // IST date string, independent of the server's own TZ setting — used so
+    // the daily counter rolls over at IST midnight, not UTC midnight.
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+}
+
 function isWithinSendingWindow() {
     if (!QUIET_HOURS_ENABLED) return true;
-    const hour = new Date().getHours();
+    // Always compute in IST regardless of the server's own TZ (Render defaults
+    // to UTC), so this doesn't silently break if TZ env var is ever unset.
+    const hour = Number(new Intl.DateTimeFormat('en-US', {
+        hour: 'numeric',
+        hour12: false,
+        timeZone: 'Asia/Kolkata'
+    }).format(new Date()));
     return hour >= QUIET_HOURS_START && hour < QUIET_HOURS_END;
 }
 
@@ -274,7 +289,7 @@ function looksLikeBanSignal(message) {
 // the daily ceiling. This IS the one hard limit that matters most; the
 // per-message/batch delays only smooth out how it's spent through the day.
 let dailyCount = persisted.dailyCount || 0;
-let dailyDateKey = persisted.dailyDateKey || new Date().toDateString();
+let dailyDateKey = persisted.dailyDateKey || getISTDateKey();
 
 // ── Warm-up ramp (OFF by default — see note below) ─────────────────────────
 // A number that starts sending 150/day from the moment it's linked (or
@@ -505,7 +520,7 @@ async function processQueue() {
             break; // the setInterval nudge below will resume this once we're back in-window
         }
 
-        const todayKey = new Date().toDateString();
+        const todayKey = getISTDateKey();
         if (todayKey !== dailyDateKey) {
             dailyDateKey = todayKey;
             dailyCount = 0;
@@ -664,7 +679,7 @@ app.get('/health', (req, res) => {
 app.get('/status', requireApiKey, (req, res) => {
     // reconcile the counter with "today" before reporting, in case no
     // send has happened yet since midnight
-    const todayKey = new Date().toDateString();
+    const todayKey = getISTDateKey();
     if (todayKey !== dailyDateKey) {
         dailyDateKey = todayKey;
         dailyCount = 0;
